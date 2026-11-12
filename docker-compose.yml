@@ -54,7 +54,7 @@ services:
       BOOTSTRAP_SERVER: kafka:29092
     volumes:
       - ./kafka:/scripts:ro
-    command: ["sh", "/scripts/create-topics.sh"]
+    command: ["sh", "/scripts/CreateTopics.sh"]
     restart: "no"
 
   # ---------------------------------------------------------------
