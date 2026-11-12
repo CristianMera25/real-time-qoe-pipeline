@@ -74,4 +74,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  kafka_data:
+  kafka_data: 
