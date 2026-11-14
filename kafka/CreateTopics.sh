@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-for t in streaming_events dlq_streaming_events qoe_alerts; do
+for t in streaming_events logins dlq_streaming_events qoe_alerts ; do
   /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server "$BOOTSTRAP_SERVER" \
     --create --if-not-exists \
