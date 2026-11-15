@@ -1,3 +1,12 @@
+"""
+Streaming events producer Simulator.
+
+Simulates concurrent video streaming users across multiple device types and
+network conditions, modeling Adaptive Bitrate (ABR) switching, buffer health,
+network degradation incidents, and controlled malformed-event injection for
+Dead Letter Queue (DLQ) testing.
+"""
+
 import argparse
 import asyncio
 import json
@@ -38,6 +47,7 @@ VIDEO_CATALOG = ["vid_%03d" % i for i in range(1, 61)]
 
 
 def weighted(options: dict):
+    """Select a random key from `options` using its values as probability weights."""
     return random.choices(list(options), weights=list(options.values()))[0]
 
 
@@ -45,6 +55,13 @@ def weighted(options: dict):
 # Corrupted messages
 # ----------------------------------------------------------------------------
 def corrupt(event: dict) -> bytes:
+    """Intentionally corrupt a valid event payload to test downstream DLQ handling.
+
+    Randomly applies one of three failure modes:
+        - `missing_field`: Drops a required schema attribute.
+        - `wrong_type`: Replaces numeric `current_bitrate` with a string.
+        - `truncated`: Slices the serialized JSON string mid-payload.
+    """
     kind = random.choice(["missing_field", "wrong_type", "truncated"])
     if kind == "missing_field":
         bad = dict(event)
@@ -62,6 +79,13 @@ def corrupt(event: dict) -> bytes:
 # Context shared by all coroutines
 # ----------------------------------------------------------------------------
 class Context:
+    """Shared state and configuration passed across all concurrent user coroutines.
+
+    Centralizes simulation parameters, tracks active session counts, manages
+    scheduled network incident windows, and routes serialized events (valid or
+    corrupted) to the Kafka `Sender`.
+    """
+
     def __init__(self, sender: Sender, args):
         self.sender = sender
         self.malformed_rate = args.malformed_rate
@@ -75,12 +99,18 @@ class Context:
         self.active = 0
 
     def incident_active(self) -> bool:
+        """Return True if the simulation clock is within a scheduled incident window."""
         if self.incident_start is None:
             return False
         elapsed = time.monotonic() - self.t0
         return self.incident_start <= elapsed < self.incident_start + self.incident_duration
 
     async def send(self, event: dict):
+        """Serialize an event (injecting corruption at `malformed_rate`) and send it.
+
+        Uses `session_id` as the Kafka partition key so all events belonging to
+        the same viewing session preserve strict ordering within a partition.
+        """
         if random.random() < self.malformed_rate:
             value = corrupt(event)
             self.sender.stats["MALFORMED"] += 1
@@ -95,6 +125,7 @@ class Context:
 # profile of each user, and their viewing session
 # ----------------------------------------------------------------------------
 class UserProfile:
+    """Static hardware, network, and incident-susceptibility profile for a user."""
     def __init__(self, n: int, incident_ratio: float):
         self.user_id = "user_%05d" % n
         self.device = weighted({d: v[0] for d, v in DEVICES.items()})
@@ -105,6 +136,12 @@ class UserProfile:
 
 
 class Session:
+    """Simulates a single video viewing session with ABR logic and buffer physics.
+
+    Models a finite-state player (`PLAYING`, `BUFFERING`, `PAUSED`), network
+    jitter, transient drops, mass outage incidents, and Adaptive Bitrate (ABR)
+    quality adjustments over a randomized viewing duration (60s–1800s).
+    """
     def __init__(self, profile: UserProfile, ctx: Context):
         self.p = profile
         self.ctx = ctx
@@ -119,13 +156,19 @@ class Session:
         self.hb_in = random.randint(10, 15)
         self.cooldown = 0
 
+        # Select highest initial quality level with at least a 1.5x bandwidth margin
         self.level = 0
         for lvl in range(profile.cap + 1):
             if self.bw >= 1.5 * BITRATE_LADDER[lvl]:
                 self.level = lvl
 
-    # --- network -------------------------------------------------------------
+    # --- network simulation -------------------------------------------------------------
     def current_bandwidth(self) -> float:
+        """Compute instantaneous available bandwidth (Kbps) for the current tick.
+
+        Applies random walk jitter (±10%), transient per-user network dips,
+        and severe throughput throttling if a global incident affects this user.
+        """
         self.bw = min(max(self.bw * random.uniform(0.9, 1.1), self.p.base_bw * 0.5),
                       self.p.base_bw * 1.3)
         if self.dip_left > 0:
@@ -139,6 +182,13 @@ class Session:
 
     # --- ABR (Adaptive Bitrate) ---------------------------------------------
     def abr(self, bw: float):
+        """Evaluate buffer health and bandwidth to adjust video bitrate level.
+
+        Downgrades immediately (emitting `QUALITY_DROP`) when buffer falls below
+        `LOW_BUFFER`. Upgrades silently when buffer exceeds 80% capacity and
+        bandwidth is at least 2x the next ladder tier. Uses cooldown timers to
+        prevent rapid bitrate oscillation.
+        """
         if self.cooldown > 0:
             self.cooldown -= 1
             return []
@@ -152,11 +202,12 @@ class Session:
             self.cooldown = 15
         return []
 
-    # --- one simulated "second" ---------------------------------------------
+    # --- Simulation tick ---------------------------------------------
     def step(self):
+        """Advance playback simulation by one tick and return emitted event types."""
         events = []
         bw = self.current_bandwidth()
-        ratio = bw / BITRATE_LADDER[self.level] 
+        ratio = bw / BITRATE_LADDER[self.level] # Seconds of video downloaded per second
 
         if self.state == "PLAYING":
 
@@ -176,13 +227,13 @@ class Session:
             if self.buffer >= RESUME_BUFFER:
                 self.state = "PLAYING"
                 events.append(PLAY)
-        else:
+        else: # PAUSED
             self.buffer = min(self.max_buffer, self.buffer + ratio)
             self.pause_left -= 1
             if self.pause_left <= 0:
                 self.state = "PLAYING"
                 events.append(PLAY)
-
+        # Periodic HEARTBEAT telemetry while actively playing
         self.hb_in -= 1
         if self.hb_in <= 0:
             self.hb_in = random.randint(10, 15)
@@ -191,6 +242,7 @@ class Session:
         return events
 
     def event(self, event_type: str) -> dict:
+        """Build a standardized JSON-serializable telemetry payload dictionary."""
         return {
             "session_id": self.session_id,
             "user_id": self.p.user_id,
@@ -204,6 +256,7 @@ class Session:
         }
 
     async def run(self):
+        """Execute the full lifecycle of a viewing session from PLAY to STOP."""
         ctx = self.ctx
         await ctx.send(self.event(PLAY))
         for _ in range(random.randint(60, 1800)):
@@ -214,8 +267,16 @@ class Session:
                 await ctx.send(self.event(et))
         await ctx.send(self.event(STOP))
 
-
+# ----------------------------------------------------------------------------
+# Concurrent user orchestration and reporting
+# ----------------------------------------------------------------------------
 async def user_loop(n: int, ctx: Context):
+    """Lifecycle loop for a single simulated user across multiple viewing sessions.
+
+    Staggers initial startup across `ctx.ramp` seconds to prevent thundering-herd
+    spikes, then repeatedly runs viewing sessions separated by brief idle pauses
+    until `ctx.stop` is triggered.
+    """
     profile = UserProfile(n, ctx.incident_ratio)
     await asyncio.sleep(random.uniform(0, ctx.ramp))
     while not ctx.stop.is_set():
@@ -231,6 +292,7 @@ async def user_loop(n: int, ctx: Context):
 # Console report
 # ----------------------------------------------------------------------------
 async def report(ctx: Context, every: float = 5.0):
+    """Periodically print throughput and event-breakdown metrics to stdout."""
     last_total, last_t = 0, time.monotonic()
     while True:
         await asyncio.sleep(every)
@@ -244,8 +306,11 @@ async def report(ctx: Context, every: float = 5.0):
                 s[QUALITY_DROP], s[PAUSE], s[STOP], s["MALFORMED"], ctx.sender.errors,
                 " | INCIDENT ACTIVE" if ctx.incident_active() else ""), flush=True)
 
-
+# ----------------------------------------------------------------------------
+# Entry point and CLI configuration
+# ----------------------------------------------------------------------------
 async def main(args):
+    """Initialize Kafka producer, spawn concurrent user tasks, and manage shutdown."""
     producer = await make_producer(args.bootstrap, dry_run=args.dry_run)
     sender = Sender(producer, args.topic)
     ctx = Context(sender, args)
@@ -264,6 +329,7 @@ async def main(args):
     finally:
         ctx.stop.set()
         try:
+            # Allow up to 8s for active sessions to emit their final STOP event
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=8)
         except asyncio.TimeoutError:
             pass
@@ -275,6 +341,7 @@ async def main(args):
 
 
 def parse_args():
+    """Parse CLI flags with fallback defaults read from environment variables."""
     ap = argparse.ArgumentParser(description="StreamSense streaming events simulator")
     ap.add_argument("--bootstrap", default=env_str("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     ap.add_argument("--topic", default=env_str("TOPIC", "streaming_events"))
