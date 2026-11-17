@@ -23,6 +23,14 @@ from common import (Sender, env_bool, env_float, env_int, env_str,
 PLAY, PAUSE, BUFFERING, STOP = "PLAY", "PAUSE", "BUFFERING", "STOP"
 HEARTBEAT, QUALITY_DROP = "HEARTBEAT", "QUALITY_DROP"
 
+# DLQ error types (catalog documented in the project docs)
+INVALID_JSON, MISSING_FIELD = "INVALID_JSON", "MISSING_FIELD"
+INVALID_TYPE, INVALID_VALUE = "INVALID_TYPE", "INVALID_VALUE"
+ERROR_TYPES = [INVALID_JSON, MISSING_FIELD, INVALID_TYPE, INVALID_VALUE]
+
+# Numeric fields of the payload (targets of the INVALID_TYPE corruption)
+NUMERIC_FIELDS = ["timestamp", "current_bitrate", "buffer_health_seconds"]
+
 # Bitrate ladder (Kbps): 400 ~ 240p, 800 ~ 360p, 1500 ~ mobile 720p,
 # 3000 ~ web 720p/1080p, 5000 ~ TV 1080p
 BITRATE_LADDER = [400, 800, 1500, 3000, 5000]
@@ -54,25 +62,67 @@ def weighted(options: dict):
 # ----------------------------------------------------------------------------
 # Corrupted messages
 # ----------------------------------------------------------------------------
-def corrupt(event: dict) -> bytes:
+def corrupt(event: dict) -> tuple[bytes, str]:
     """Intentionally corrupt a valid event payload to test downstream DLQ handling.
 
-    Randomly applies one of three failure modes:
-        - `missing_field`: Drops a required schema attribute.
-        - `wrong_type`: Replaces numeric `current_bitrate` with a string.
-        - `truncated`: Slices the serialized JSON string mid-payload.
+    Randomly picks one DLQ error type and applies one of its variants:
+        - `INVALID_JSON`: The payload cannot be parsed (truncated, empty or garbage).
+        - `MISSING_FIELD`: A required field is removed or set to `null`.
+        - `INVALID_TYPE`: A numeric field receives non-numeric text.
+        - `INVALID_VALUE`: Correct type, but a value outside the documented rules
+          (unknown `event_type`, negative or oversized buffer, bitrate <= 0,
+          impossible `timestamp`, device or connection outside the catalog,
+          empty identifier).
+
+    Returns:
+        A tuple `(payload, error_type)`. `error_type` is the label the DLQ
+        should report for this message, so the producer's counters can be
+        reconciled against what the processing job writes to the DLQ.
     """
-    kind = random.choice(["missing_field", "wrong_type", "truncated"])
-    if kind == "missing_field":
-        bad = dict(event)
-        bad.pop(random.choice(["user_id", "video_id", "event_type", "timestamp"]))
-        return json.dumps(bad).encode()
-    if kind == "wrong_type":
-        bad = dict(event)
-        bad["current_bitrate"] = "high"
-        return json.dumps(bad).encode()
-    raw = json.dumps(event)
-    return raw[: random.randint(20, len(raw) - 2)].encode()
+    error_type = random.choice(ERROR_TYPES)
+
+    if error_type == INVALID_JSON:
+        raw = json.dumps(event)
+        variant = random.choice(["truncated", "empty", "garbage"])
+        if variant == "truncated":
+            return raw[: random.randint(20, len(raw) - 2)].encode(), error_type
+        if variant == "empty":
+            return b"", error_type
+        return random.choice([b"not a json payload",
+                              b"<html>502 Bad Gateway</html>",
+                              b"{'event_type': 'PLAY'}"]), error_type   # single quotes: not JSON
+
+    bad = dict(event)
+
+    if error_type == MISSING_FIELD:
+        field = random.choice(list(bad))
+        if random.random() < 0.5:
+            del bad[field]
+        else:
+            bad[field] = None
+    elif error_type == INVALID_TYPE:
+        # Non-numeric text on purpose: a numeric string such as "1500" could be
+        # silently coerced by a lenient parser and stop being an invalid case.
+        bad[random.choice(NUMERIC_FIELDS)] = random.choice(["high", "N/A", "not_a_number"])
+    else:  # INVALID_VALUE
+        case = random.choice(["event_type", "buffer", "bitrate", "timestamp",
+                              "device", "connection", "empty_id"])
+        if case == "event_type":
+            bad["event_type"] = random.choice(["REWIND", "SEEK", "UNKNOWN"])
+        elif case == "buffer":
+            bad["buffer_health_seconds"] = random.choice([-round(random.uniform(1, 10), 1), 9999.0])
+        elif case == "bitrate":
+            bad["current_bitrate"] = random.choice([0, -random.choice(BITRATE_LADDER)])
+        elif case == "timestamp":
+            # before 2020-01-01, or ten years in the future
+            bad["timestamp"] = random.choice([0, 946684800, int(time.time()) + 10 * 365 * 86400])
+        elif case == "device":
+            bad["device_model"] = random.choice(["Tablet", "Console", "SmartFridge"])
+        elif case == "connection":
+            bad["connection_type"] = random.choice(["5G", "Satellite"])
+        else:
+            bad[random.choice(["session_id", "user_id", "video_id"])] = ""
+    return json.dumps(bad).encode(), error_type
 
 
 # ----------------------------------------------------------------------------
@@ -110,10 +160,13 @@ class Context:
 
         Uses `session_id` as the Kafka partition key so all events belonging to
         the same viewing session preserve strict ordering within a partition.
+        Every corrupted message is counted under `MALFORMED` and under
+        `MALFORMED_<error_type>` (the ground truth for the DLQ).
         """
         if random.random() < self.malformed_rate:
-            value = corrupt(event)
+            value, error_type = corrupt(event)
             self.sender.stats["MALFORMED"] += 1
+            self.sender.stats["MALFORMED_" + error_type] += 1
         else:
             value = json.dumps(event).encode()
         # The key is session_id: every event of a session goes to the same
@@ -338,6 +391,9 @@ async def main(args):
         await producer.stop()
         print("Done. Total sent: %d | malformed: %d | errors: %d" % (
             sender.stats["TOTAL"], sender.stats["MALFORMED"], sender.errors), flush=True)
+        # Ground truth to reconcile against the DLQ written by the processing job
+        print("Malformed by error_type: %s" % " | ".join(
+            "%s=%d" % (e, sender.stats["MALFORMED_" + e]) for e in ERROR_TYPES), flush=True)
 
 
 def parse_args():
