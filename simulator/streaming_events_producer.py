@@ -53,6 +53,20 @@ DIP_PROB = 0.01           # per-second probability of a natural network dip star
 PAUSE_PROB = 0.002        # per-second probability that the user pauses
 VIDEO_CATALOG = ["vid_%03d" % i for i in range(1, 61)]
 
+# Incident severity -> (min, max) fraction of its bandwidth an affected user keeps.
+#   mild:   throughput shrinks enough to force ABR downgrades (QUALITY_DROP)
+#           without freezing most of the playback.
+#   severe: the network almost disappears and playback freezes (BUFFERING).
+INCIDENT_SEVERITY = {"mild": (0.15, 0.35), "severe": (0.005, 0.02)}
+
+# Ready-made demo scenarios (SCENARIO env var / --scenario). Explicit flags or
+# environment variables for each option still take precedence over a preset.
+SCENARIOS = {
+    "baseline": {},   # no incident
+    "mild": {"incident_start": 120.0, "incident_duration": 120.0, "incident_severity": "mild"},
+    "severe": {"incident_start": 120.0, "incident_duration": 90.0, "incident_severity": "severe"},
+}
+
 
 def weighted(options: dict):
     """Select a random key from `options` using its values as probability weights."""
@@ -143,6 +157,7 @@ class Context:
         self.incident_start = args.incident_start
         self.incident_duration = args.incident_duration
         self.incident_ratio = args.incident_ratio
+        self.incident_severity = args.incident_severity
         self.ramp = args.ramp
         self.t0 = time.monotonic()
         self.stop = asyncio.Event()
@@ -207,7 +222,7 @@ class Session:
         self.state = "PLAYING"
         self.pause_left = 0
         self.hb_in = random.randint(10, 15)
-        self.cooldown = 0
+        self.cooldown = 10      # startup grace period: the buffer is still filling, so no ABR yet
 
         # Select highest initial quality level with at least a 1.5x bandwidth margin
         self.level = 0
@@ -220,7 +235,8 @@ class Session:
         """Compute instantaneous available bandwidth (Kbps) for the current tick.
 
         Applies random walk jitter (±10%), transient per-user network dips,
-        and severe throughput throttling if a global incident affects this user.
+        and throughput throttling if a global incident affects this user (the
+        depth of the throttling is set by `INCIDENT_SEVERITY`).
         """
         self.bw = min(max(self.bw * random.uniform(0.9, 1.1), self.p.base_bw * 0.5),
                       self.p.base_bw * 1.3)
@@ -230,7 +246,7 @@ class Session:
             self.dip_left = random.randint(5, 25)
         factor = random.uniform(0.03, 0.25) if self.dip_left > 0 else 1.0
         if self.p.affected and self.ctx.incident_active():
-            factor *= random.uniform(0.005, 0.02) 
+            factor *= random.uniform(*INCIDENT_SEVERITY[self.ctx.incident_severity])
         return self.bw * factor
 
     # --- ABR (Adaptive Bitrate) ---------------------------------------------
@@ -370,7 +386,8 @@ async def main(args):
     install_stop_handlers(ctx.stop)
     print("Simulating %d users -> %s (%s)%s" % (
         args.users, args.topic, "DRY-RUN" if args.dry_run else args.bootstrap,
-        " | incident at t=%ss" % args.incident_start if args.incident_start is not None else ""),
+        " | %s incident at t=%ss" % (args.incident_severity, args.incident_start)
+        if args.incident_start is not None else ""),
         flush=True)
 
     tasks = [asyncio.create_task(user_loop(i, ctx)) for i in range(args.users)]
@@ -397,8 +414,18 @@ async def main(args):
 
 
 def parse_args():
-    """Parse CLI flags with fallback defaults read from environment variables."""
-    ap = argparse.ArgumentParser(description="StreamSense streaming events simulator")
+    """Parse CLI flags with fallback defaults read from environment variables.
+
+    Precedence: command-line flag > environment variable > `--scenario` preset >
+    built-in default.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--scenario", choices=sorted(SCENARIOS), default=env_str("SCENARIO", None),
+                     help="demo scenario preset: baseline (no incident), mild or severe incident")
+    scenario = pre.parse_known_args()[0].scenario
+    preset = SCENARIOS.get(scenario, {})
+
+    ap = argparse.ArgumentParser(description="StreamSense streaming events simulator", parents=[pre])
     ap.add_argument("--bootstrap", default=env_str("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     ap.add_argument("--topic", default=env_str("TOPIC", "streaming_events"))
     ap.add_argument("--users", type=int, default=env_int("USERS", 1000),
@@ -409,9 +436,12 @@ def parse_args():
                     help="seconds over which users are started")
     ap.add_argument("--malformed-rate", type=float, default=env_float("MALFORMED_RATE", 0.01),
                     help="fraction of corrupted messages for the DLQ (0.01 = 1%%)")
-    ap.add_argument("--incident-start", type=float, default=env_float("INCIDENT_START", None),
+    ap.add_argument("--incident-start", type=float, default=env_float("INCIDENT_START", preset.get("incident_start")),
                     help="second at which a network incident starts (to trigger alerts)")
-    ap.add_argument("--incident-duration", type=float, default=env_float("INCIDENT_DURATION", 90.0))
+    ap.add_argument("--incident-duration", type=float, default=env_float("INCIDENT_DURATION", preset.get("incident_duration", 90.0)))
+    ap.add_argument("--incident-severity", choices=sorted(INCIDENT_SEVERITY),
+                    default=env_str("INCIDENT_SEVERITY", preset.get("incident_severity", "severe")),
+                    help="mild = ABR downgrades without freezing, severe = playback freezes")
     ap.add_argument("--incident-ratio", type=float, default=env_float("INCIDENT_RATIO", 0.4),
                     help="fraction of users affected by the incident")
     ap.add_argument("--tick", type=float, default=env_float("TICK", 1.0),
