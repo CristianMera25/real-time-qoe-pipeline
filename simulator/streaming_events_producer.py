@@ -15,7 +15,8 @@ import time
 import uuid
 
 from common import (Sender, env_bool, env_float, env_int, env_str,
-                    install_stop_handlers, make_producer)
+                    install_stop_handlers, make_producer,
+                    user_id, user_traits, validate_user_count)
 
 # ----------------------------------------------------------------------------
 # Domain constants
@@ -35,8 +36,9 @@ NUMERIC_FIELDS = ["timestamp", "current_bitrate", "buffer_health_seconds"]
 # 3000 ~ web 720p/1080p, 5000 ~ TV 1080p
 BITRATE_LADDER = [400, 800, 1500, 3000, 5000]
 
-# device -> (weight, highest index of the bitrate ladder it supports)
-DEVICES = {"SmartTV": (0.35, 4), "Web": (0.35, 3), "Mobile": (0.30, 2)}
+# device -> highest index of the bitrate ladder it supports
+# (the devices and their weights live in common.py, shared with the logins producer)
+DEVICE_MAX_LEVEL = {"SmartTV": 4, "Web": 3, "Mobile": 2}
 
 # device -> possible connection types (weights)
 CONNECTIONS_BY_DEVICE = {
@@ -84,9 +86,9 @@ def corrupt(event: dict) -> tuple[bytes, str]:
         - `MISSING_FIELD`: A required field is removed or set to `null`.
         - `INVALID_TYPE`: A numeric field receives non-numeric text.
         - `INVALID_VALUE`: Correct type, but a value outside the documented rules
-          (unknown `event_type`, negative or oversized buffer, bitrate <= 0,
-          impossible `timestamp`, device or connection outside the catalog,
-          empty identifier).
+            (unknown `event_type`, negative or oversized buffer, bitrate <= 0,
+            impossible `timestamp`, device or connection outside the catalog,
+            empty identifier).
 
     Returns:
         A tuple `(payload, error_type)`. `error_type` is the label the DLQ
@@ -103,8 +105,8 @@ def corrupt(event: dict) -> tuple[bytes, str]:
         if variant == "empty":
             return b"", error_type
         return random.choice([b"not a json payload",
-                              b"<html>502 Bad Gateway</html>",
-                              b"{'event_type': 'PLAY'}"]), error_type   # single quotes: not JSON
+                                b"<html>502 Bad Gateway</html>",
+                                b"{'event_type': 'PLAY'}"]), error_type   # single quotes: not JSON
 
     bad = dict(event)
 
@@ -120,7 +122,7 @@ def corrupt(event: dict) -> tuple[bytes, str]:
         bad[random.choice(NUMERIC_FIELDS)] = random.choice(["high", "N/A", "not_a_number"])
     else:  # INVALID_VALUE
         case = random.choice(["event_type", "buffer", "bitrate", "timestamp",
-                              "device", "connection", "empty_id"])
+                                "device", "connection", "empty_id"])
         if case == "event_type":
             bad["event_type"] = random.choice(["REWIND", "SEEK", "UNKNOWN"])
         elif case == "buffer":
@@ -193,12 +195,16 @@ class Context:
 # profile of each user, and their viewing session
 # ----------------------------------------------------------------------------
 class UserProfile:
-    """Static hardware, network, and incident-susceptibility profile for a user."""
+    """Static hardware, network, and incident-susceptibility profile for a user.
+
+    The id and the device come from the shared user pool (`common.py`), so the
+    same user has the same id and device in the logins producer.
+    """
     def __init__(self, n: int, incident_ratio: float):
-        self.user_id = "user_%05d" % n
-        self.device = weighted({d: v[0] for d, v in DEVICES.items()})
+        self.user_id = user_id(n)
+        self.device, _ = user_traits(n)
         self.connection = weighted(CONNECTIONS_BY_DEVICE[self.device])
-        self.cap = DEVICES[self.device][1]                  # max quality the device supports
+        self.cap = DEVICE_MAX_LEVEL[self.device]            # max quality the device supports
         self.base_bw = BASE_BANDWIDTH[self.connection] * random.uniform(0.7, 1.2)
         self.affected = random.random() < incident_ratio
 
@@ -380,6 +386,7 @@ async def report(ctx: Context, every: float = 5.0):
 # ----------------------------------------------------------------------------
 async def main(args):
     """Initialize Kafka producer, spawn concurrent user tasks, and manage shutdown."""
+    validate_user_count(args.users)
     producer = await make_producer(args.bootstrap, dry_run=args.dry_run)
     sender = Sender(producer, args.topic)
     ctx = Context(sender, args)

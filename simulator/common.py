@@ -1,12 +1,14 @@
 """
 Shared utilities for Kafka producers.
 
-Provides environment variable parsing helpers, signal handling for graceful
-shutdowns, producer initialization with retry logic, and a dry-run mock producer.
+Provides environment variable parsing helpers, a shared user pool (so every
+producer simulates the same users), signal handling for graceful shutdowns,
+producer initialization with retry logic, and a dry-run mock producer.
 """
 
 import asyncio
 import os
+import random
 import signal
 from collections import Counter
 
@@ -38,6 +40,60 @@ def env_bool(name, default=False):
     """Read an environment variable as a boolean ('1', 'true', 'yes' - True)."""
     v = os.getenv(name)
     return default if v in (None, "") else v.strip().lower() in ("1", "true", "yes")
+
+
+# ----------------------------------------------------------------------------
+# Shared user pool
+# ----------------------------------------------------------------------------
+# Every producer must simulate the SAME users, otherwise events from different
+# topics could never be correlated by `user_id`. The pool is defined here and
+# nowhere else: user `n` always has the same id, the same device and the same
+# home location, in every producer and in every run.
+
+# Maximum number of users of the platform (upper bound for each producer's USERS)
+USER_POOL_SIZE = env_int("USER_POOL_SIZE", 5000)
+
+# device -> weight
+DEVICE_WEIGHTS = {"SmartTV": 0.35, "Web": 0.35, "Mobile": 0.30}
+
+# (country, city) -> weight
+LOCATIONS = {
+    ("CO", "Cali"): 0.20, ("CO", "Bogota"): 0.20, ("CO", "Medellin"): 0.10,
+    ("MX", "Mexico City"): 0.15, ("AR", "Buenos Aires"): 0.10,
+    ("CL", "Santiago"): 0.07, ("PE", "Lima"): 0.08, ("ES", "Madrid"): 0.10,
+}
+
+
+def user_id(n: int) -> str:
+    """Return the canonical id of the n-th user of the shared pool (e.g. `user_00042`)."""
+    return "user_%05d" % n
+
+
+def user_traits(n: int) -> tuple:
+    """Return the fixed traits `(device, home_location)` of the n-th user.
+
+    The traits are drawn from a random generator seeded with `n`, not from the
+    global one, so they are identical in every producer and in every run, and
+    they do not change when a simulation seed (`--seed`) is used.
+
+    Returns:
+        A tuple `(device, (country, city))`, for example `("Mobile", ("CO", "Cali"))`.
+    """
+    rng = random.Random("streamsense-user-%d" % n)
+    device = rng.choices(list(DEVICE_WEIGHTS), weights=list(DEVICE_WEIGHTS.values()))[0]
+    home = rng.choices(list(LOCATIONS), weights=list(LOCATIONS.values()))[0]
+    return device, home
+
+
+def validate_user_count(users: int):
+    """Abort if a producer asks for more users than the shared pool contains.
+
+    Raises:
+        SystemExit: If `users` exceeds `USER_POOL_SIZE`.
+    """
+    if users > USER_POOL_SIZE:
+        raise SystemExit("USERS=%d exceeds USER_POOL_SIZE=%d; use the same USER_POOL_SIZE "
+                            "in every producer" % (users, USER_POOL_SIZE))
 
 
 class DryRunProducer:

@@ -5,8 +5,9 @@ import random
 import time
 import uuid
 
-from common import (Sender, env_bool, env_float, env_int, env_str,
-                    install_stop_handlers, make_producer)
+from common import (LOCATIONS, Sender, env_bool, env_float, env_int, env_str,
+                    install_stop_handlers, make_producer,
+                    user_id, user_traits, validate_user_count)
 
 # ----------------------------------------------------------------------------
 # Domain constants
@@ -21,15 +22,8 @@ INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR"
 FAILED_REASONS = {INVALID_PASSWORD: 0.85, USER_NOT_FOUND: 0.15}
 ERROR_REASONS = {SERVER_UNREACHABLE: 0.40, TIMEOUT: 0.40, INTERNAL_SERVER_ERROR: 0.20}
 
-# same device names as streaming_events
-DEVICES = {"SmartTV": 0.35, "Web": 0.35, "Mobile": 0.30}
-
-# (country, city) -> weight
-LOCATIONS = {
-    ("CO", "Cali"): 0.20, ("CO", "Bogota"): 0.20, ("CO", "Medellin"): 0.10,
-    ("MX", "Mexico City"): 0.15, ("AR", "Buenos Aires"): 0.10,
-    ("CL", "Santiago"): 0.07, ("PE", "Lima"): 0.08, ("ES", "Madrid"): 0.10,
-}
+# DEVICE_WEIGHTS and LOCATIONS ((country, city) -> weight) live in common.py:
+# the device and home city of each user are shared with the streaming_events producer
 TRAVEL_PROB = 0.03        # probability that a login sequence comes from another city
 
 
@@ -42,7 +36,7 @@ def weighted(options: dict):
 # ----------------------------------------------------------------------------
 def corrupt(event: dict) -> bytes:
     kind = random.choice(["missing_field", "wrong_type", "truncated", "invalid_enum",
-                          "inconsistent", "bad_attempt", "bad_timestamp"])
+                            "inconsistent", "bad_attempt", "bad_timestamp"])
     if kind == "missing_field":
         bad = dict(event)
         bad.pop(random.choice(["user_id", "login_id", "status", "timestamp"]))
@@ -123,10 +117,10 @@ class Context:
 # ----------------------------------------------------------------------------
 class UserAccount:
     def __init__(self, n: int):
-        # same format as streaming_events, so both topics can be joined by user_id
-        self.user_id = "user_%05d" % n
-        self.device = weighted(DEVICES)
-        self.home = weighted(LOCATIONS)
+        # same id and device as in streaming_events (shared user pool in common.py),
+        # so both topics can be joined by user_id
+        self.user_id = user_id(n)
+        self.device, self.home = user_traits(n)
 
     def pick_location(self):
         if random.random() < TRAVEL_PROB:
@@ -194,13 +188,14 @@ async def report(ctx: Context, every: float = 5.0):
         rate = (s["TOTAL"] - last_total) / (now - last_t)
         last_total, last_t = s["TOTAL"], now
         print("[t=%4ds] msgs=%-8d (%.0f/s) | SUCCESS=%d FAILED=%d ERROR=%d RETRY=%d"
-              " | malformed=%d errors=%d%s" % (
-                  now - ctx.t0, s["TOTAL"], rate, s[SUCCESS], s[FAILED], s[ERROR],
-                  s["RETRY"], s["MALFORMED"], ctx.sender.errors,
-                  " | INCIDENT ACTIVE" if ctx.incident_active() else ""), flush=True)
+                " | malformed=%d errors=%d%s" % (
+                    now - ctx.t0, s["TOTAL"], rate, s[SUCCESS], s[FAILED], s[ERROR],
+                    s["RETRY"], s["MALFORMED"], ctx.sender.errors,
+                    " | INCIDENT ACTIVE" if ctx.incident_active() else ""), flush=True)
 
 
 async def main(args):
+    validate_user_count(args.users)
     producer = await make_producer(args.bootstrap, dry_run=args.dry_run)
     sender = Sender(producer, args.topic)
     ctx = Context(sender, args)
